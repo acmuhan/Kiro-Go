@@ -17,6 +17,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -50,9 +51,30 @@ type Account struct {
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
+	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+
+	// Per-account outbound proxy (falls back to global ProxyURL if empty)
+	ProxyURL string `json:"proxyURL,omitempty"`
 
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
+
+	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
+	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
+	// Allowed values: "ENABLED", "DISABLED", "UNKNOWN" (or empty when not yet fetched).
+	OverageStatus     string  `json:"overageStatus,omitempty"`
+	OverageCapability string  `json:"overageCapability,omitempty"` // "OVERAGE_CAPABLE" / "NOT_OVERAGE_CAPABLE"
+	OverageCap        float64 `json:"overageCap,omitempty"`        // Hard upper bound (USD)
+	OverageRate       float64 `json:"overageRate,omitempty"`       // Per-invocation rate (USD)
+	CurrentOverages   float64 `json:"currentOverages,omitempty"`   // Cumulative overage charges (USD)
+	OverageCheckedAt  int64   `json:"overageCheckedAt,omitempty"`  // Last successful upstream sync (Unix seconds)
+
+	// LegacyAllowOverage is kept for backward-compatible JSON loading only.
+	// Pre-Overages-switch deployments persisted `allowOverage: true` to mean
+	// "keep dispatching when quota is exhausted". On first load we migrate it
+	// into OverageStatus="ENABLED" and zero this field so it does not get
+	// re-emitted on future saves. Do not read this field elsewhere.
+	LegacyAllowOverage bool `json:"allowOverage,omitempty"`
 
 	// Account status
 	Enabled   bool   `json:"enabled"`             // Whether account is active in the pool
@@ -87,32 +109,99 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 }
 
+// PromptFilterRule defines a single custom prompt sanitization rule.
+// Type can be: "regex" (regexp find/replace within prompt) or
+// "lines-containing" (remove lines containing the match substring).
+type PromptFilterRule struct {
+	ID      string `json:"id"`                // Unique rule identifier
+	Name    string `json:"name"`              // Human-readable rule name
+	Type    string `json:"type"`              // "regex" or "lines-containing"
+	Match   string `json:"match"`             // Pattern to match (regex pattern or substring)
+	Replace string `json:"replace,omitempty"` // Replacement string (only for regex; empty = delete match)
+	Enabled bool   `json:"enabled"`           // Whether this rule is active
+}
+
+// ApiKeyEntry represents a single API key with optional usage limits and counters.
+// Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
+// automatically; operators can use the admin endpoint to manually reset them.
+type ApiKeyEntry struct {
+	ID         string `json:"id"`                 // Unique identifier (UUID)
+	Name       string `json:"name,omitempty"`     // Human-readable label
+	Key        string `json:"key"`                // The actual key value clients send
+	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
+	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
+	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
+	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
+
+	// Limits (0 = unlimited)
+	TokenLimit  int64   `json:"tokenLimit,omitempty"`
+	CreditLimit float64 `json:"creditLimit,omitempty"`
+
+	// Cumulative usage (never auto-reset)
+	TokensUsed    int64   `json:"tokensUsed,omitempty"`
+	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
+	RequestsCount int64   `json:"requestsCount,omitempty"`
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
-	Password      string    `json:"password"`         // Admin panel password
-	Port          int       `json:"port"`             // HTTP server port (default: 8080)
-	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
-	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
-	KiroVersion   string    `json:"kiroVersion,omitempty"`
-	SystemVersion string    `json:"systemVersion,omitempty"`
-	NodeVersion   string    `json:"nodeVersion,omitempty"`
-	Accounts      []Account `json:"accounts"` // Registered Kiro accounts
+	Password      string        `json:"password"`          // Admin panel password
+	Port          int           `json:"port"`              // HTTP server port (default: 8080)
+	Host          string        `json:"host"`              // HTTP server bind address (default: 0.0.0.0)
+	ApiKey        string        `json:"apiKey,omitempty"`  // [Deprecated] Legacy single API key, migrated into ApiKeys on first load
+	RequireApiKey bool          `json:"requireApiKey"`     // [Deprecated] Whether to enforce API key validation; with multi-key support, len(ApiKeys)>0 implicitly enforces auth
+	ApiKeys       []ApiKeyEntry `json:"apiKeys,omitempty"` // Multiple API keys, each with independent quota
+	KiroVersion   string        `json:"kiroVersion,omitempty"`
+	SystemVersion string        `json:"systemVersion,omitempty"`
+	NodeVersion   string        `json:"nodeVersion,omitempty"`
+	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
-	// Endpoint configuration: "auto", "codewhisperer", or "amazonq"
+	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
+
+	// EndpointFallback controls whether to try other endpoints when the preferred one fails.
+	// Defaults to true. Set to false to only use the preferred endpoint.
+	EndpointFallback *bool `json:"endpointFallback,omitempty"`
+
+	// AllowOverUsage allows accounts to continue serving requests even when their
+	// usage quota has been exhausted. When enabled, the pool will not skip accounts
+	// solely because usageCurrent >= usageLimit.
+	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
+	// Migrated to FilterClaudeCode on first load. Do not use directly.
+	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
+
+	// FilterClaudeCode detects the Claude Code CLI built-in system prompt and replaces it
+	// with a compact backend-only prompt, reducing token usage significantly.
+	FilterClaudeCode bool `json:"filterClaudeCode,omitempty"`
+
+	// FilterEnvNoise strips environment metadata lines from system prompts:
+	// git status, recent commits, environment sections, fast_mode_info tags, etc.
+	FilterEnvNoise bool `json:"filterEnvNoise,omitempty"`
+
+	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
+	FilterStripBoundaries bool `json:"filterStripBoundaries,omitempty"`
+
+	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
+	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
+
+	// LogLevel controls verbosity of application logs.
+	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
+	// Can be overridden by the LOG_LEVEL environment variable.
+	LogLevel string `json:"logLevel,omitempty"`
 
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
@@ -143,7 +232,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.6"
+const Version = "1.1.2"
 
 var (
 	cfg     *Config
@@ -174,7 +263,7 @@ func Load() error {
 				RequireApiKey: false,
 				Accounts:      []Account{},
 			}
-			return Save()
+			return saveLocked()
 		}
 		return err
 	}
@@ -184,7 +273,62 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+
+	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
+	// promote it into the new structure. The migrated entry inherits the legacy
+	// RequireApiKey state — if the legacy deployment was public (RequireApiKey=false),
+	// we mark the entry disabled so it doesn't accidentally start enforcing auth.
+	// Operators can flip it on later from the admin UI. The legacy field is kept
+	// for backward compatibility when reading older config files.
+	if cfg.ApiKey != "" && len(cfg.ApiKeys) == 0 {
+		cfg.ApiKeys = append(cfg.ApiKeys, ApiKeyEntry{
+			ID:        newUUID(),
+			Name:      "legacy",
+			Key:       cfg.ApiKey,
+			Enabled:   cfg.RequireApiKey,
+			Migrated:  true,
+			CreatedAt: time.Now().Unix(),
+		})
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration: per-account AllowOverage → OverageStatus.
+	// Pre-Overages-switch deployments stored `allowOverage: true` to mean "keep
+	// dispatching when quota is exhausted". The new model reads OverageStatus
+	// from the upstream AWS Q switch instead. To avoid silently disabling
+	// previously-allowed accounts on first launch, treat allowOverage=true as
+	// OverageStatus="ENABLED" (operators can refresh from AWS later). The
+	// legacy field is then cleared so future saves don't re-emit it.
+	overageMigrated := false
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].LegacyAllowOverage {
+			if cfg.Accounts[i].OverageStatus == "" {
+				cfg.Accounts[i].OverageStatus = "ENABLED"
+			}
+			cfg.Accounts[i].LegacyAllowOverage = false
+			overageMigrated = true
+		}
+	}
+	if overageMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
+// This is identical to Save() (which does not take the lock either) but is named
+// distinctly so call sites that already hold cfgLock are explicit about it.
+func saveLocked() error {
+	return Save()
+}
+
+// newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
+func newUUID() string {
+	return GenerateMachineId()
 }
 
 // Save persists the current configuration to the JSON file.
@@ -203,6 +347,24 @@ func SetPassword(password string) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.Password = password
+}
+
+// GetConfigDir returns the directory containing the config JSON file.
+// Useful for sibling state (e.g. stored Responses, caches) that should live
+// alongside the configuration file.
+func GetConfigDir() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfgPath == "" {
+		return "."
+	}
+	dir := cfgPath
+	for i := len(dir) - 1; i >= 0; i-- {
+		if dir[i] == '/' || dir[i] == '\\' {
+			return dir[:i]
+		}
+	}
+	return "."
 }
 
 func Get() *Config {
@@ -274,6 +436,81 @@ func UpdateAccount(id string, account Account) error {
 	return nil
 }
 
+// UpdateAccountOverageStatus persists the cached upstream overage status fields.
+// Called after a successful setUserPreference or getUsageLimits round-trip.
+func UpdateAccountOverageStatus(id, status, capability string, cap, rate, current float64, checkedAt int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			if status != "" {
+				cfg.Accounts[i].OverageStatus = status
+			}
+			if capability != "" {
+				cfg.Accounts[i].OverageCapability = capability
+			}
+			cfg.Accounts[i].OverageCap = cap
+			cfg.Accounts[i].OverageRate = rate
+			cfg.Accounts[i].CurrentOverages = current
+			if checkedAt > 0 {
+				cfg.Accounts[i].OverageCheckedAt = checkedAt
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
+// SetAccountEnabled toggles the enabled state of an account and persists the change.
+// Used to disable accounts whose refresh token has been revoked (401 Bad credentials)
+// so subsequent requests skip them automatically.
+func SetAccountEnabled(id string, enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].Enabled = enabled
+			if !enabled {
+				cfg.Accounts[i].BanStatus = "DISABLED"
+				cfg.Accounts[i].BanTime = time.Now().Unix()
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
+// SetAccountBanStatus marks an account as banned/disabled with a reason.
+// Reason is recorded so operators can see why the account was auto-disabled.
+func SetAccountBanStatus(id, status, reason string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].BanStatus = status
+			cfg.Accounts[i].BanReason = reason
+			cfg.Accounts[i].BanTime = time.Now().Unix()
+			if status == "BANNED" || status == "DISABLED" {
+				cfg.Accounts[i].Enabled = false
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
+func UpdateAccountProfileArn(id, profileArn string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].ProfileArn = profileArn
+			return Save()
+		}
+	}
+	return nil
+}
+
 func DeleteAccount(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -319,6 +556,21 @@ func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	defer cfgLock.Unlock()
 	cfg.ApiKey = apiKey
 	cfg.RequireApiKey = requireApiKey
+	if password != "" {
+		cfg.Password = password
+	}
+	return Save()
+}
+
+func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if apiKey != nil {
+		cfg.ApiKey = *apiKey
+	}
+	if requireApiKey != nil {
+		cfg.RequireApiKey = *requireApiKey
+	}
 	if password != "" {
 		cfg.Password = password
 	}
@@ -390,6 +642,89 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 	return nil
 }
 
+// GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.
+// Also checks the legacy SanitizeClaudeCodePrompt flag for backward compatibility.
+func GetFilterClaudeCode() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt
+}
+
+// GetFilterEnvNoise returns whether environment noise line stripping is enabled.
+func GetFilterEnvNoise() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FilterEnvNoise
+}
+
+// GetFilterStripBoundaries returns whether boundary marker stripping is enabled.
+func GetFilterStripBoundaries() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FilterStripBoundaries
+}
+
+// PromptFilterConfig holds all prompt filter settings for API responses.
+type PromptFilterConfig struct {
+	FilterClaudeCode      bool               `json:"filterClaudeCode"`
+	FilterEnvNoise        bool               `json:"filterEnvNoise"`
+	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
+	Rules                 []PromptFilterRule `json:"rules"`
+}
+
+// GetPromptFilterConfig returns all prompt filter settings.
+func GetPromptFilterConfig() PromptFilterConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return PromptFilterConfig{Rules: []PromptFilterRule{}}
+	}
+	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
+	copy(rules, cfg.PromptFilterRules)
+	return PromptFilterConfig{
+		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
+		FilterEnvNoise:        cfg.FilterEnvNoise,
+		FilterStripBoundaries: cfg.FilterStripBoundaries,
+		Rules:                 rules,
+	}
+}
+
+// UpdatePromptFilterConfig saves all prompt filter settings atomically.
+func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.FilterClaudeCode = filterClaudeCode
+	cfg.FilterEnvNoise = filterEnvNoise
+	cfg.FilterStripBoundaries = filterStripBoundaries
+	// Clear legacy flag to avoid double-applying after first save
+	cfg.SanitizeClaudeCodePrompt = false
+	if rules != nil {
+		cfg.PromptFilterRules = rules
+	}
+	return Save()
+}
+
+// GetPromptFilterRules returns the current prompt filter rules.
+func GetPromptFilterRules() []PromptFilterRule {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
+	copy(rules, cfg.PromptFilterRules)
+	return rules
+}
+
 // ThinkingConfig holds settings for AI thinking/reasoning mode.
 // When enabled, models output their reasoning process alongside the response.
 type ThinkingConfig struct {
@@ -451,6 +786,24 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	return Save()
 }
 
+// GetEndpointFallback returns whether endpoint fallback is enabled. Defaults to true.
+func GetEndpointFallback() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.EndpointFallback == nil {
+		return true
+	}
+	return *cfg.EndpointFallback
+}
+
+// UpdateEndpointFallback sets the endpoint fallback switch and persists the change.
+func UpdateEndpointFallback(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.EndpointFallback = &enabled
+	return Save()
+}
+
 // GetProxyURL 获取出站代理地址
 func GetProxyURL() string {
 	cfgLock.RLock()
@@ -463,6 +816,42 @@ func UpdateProxySettings(proxyURL string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	return Save()
+}
+
+// GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
+func GetAllowOverUsage() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.AllowOverUsage
+}
+
+// UpdateAllowOverUsage sets the over-usage setting and persists the change.
+func UpdateAllowOverUsage(allow bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".
+func GetLogLevel() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.LogLevel == "" {
+		return "info"
+	}
+	return cfg.LogLevel
+}
+
+// UpdateLogLevel updates the log level setting and persists the change.
+func UpdateLogLevel(level string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.LogLevel = level
 	return Save()
 }
 

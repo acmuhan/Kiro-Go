@@ -16,12 +16,14 @@ package main
 import (
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"kiro-go/pool"
 	"kiro-go/proxy"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 func main() {
@@ -41,6 +43,9 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Initialize log level: LOG_LEVEL env var takes priority over config, defaulting to "info".
+	logger.Init(config.GetLogLevel())
+
 	// 环境变量覆盖密码
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
 		config.SetPassword(envPassword)
@@ -54,12 +59,23 @@ func main() {
 
 	// 启动服务器
 	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
-	log.Printf("Kiro-Go starting on http://%s", addr)
-	log.Printf("Admin panel: http://%s/admin", addr)
-	log.Printf("Claude API: http://%s/v1/messages", addr)
-	log.Printf("OpenAI API: http://%s/v1/chat/completions", addr)
+	logger.Infof("Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))
+	logger.Infof("Admin panel: http://%s/admin", addr)
+	logger.Infof("Claude API: http://%s/v1/messages", addr)
+	logger.Infof("OpenAI API: http://%s/v1/chat/completions", addr)
 
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	// WriteTimeout intentionally 0: SSE streams can run for minutes while the
+	// upstream model produces tokens. ReadHeaderTimeout + ReadTimeout still
+	// guard against slowloris-style header/body stalls.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	if err := srv.ListenAndServe(); err != nil {
+		logger.Fatalf("Server failed: %v", err)
 	}
 }
